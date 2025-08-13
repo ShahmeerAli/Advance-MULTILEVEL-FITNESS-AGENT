@@ -12,6 +12,7 @@ from langgraph.graph.message import add_messages
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph,END,START
 from dotenv import load_dotenv,find_dotenv
+from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
 import os
 import pandas as pd
@@ -60,12 +61,12 @@ docs = [csv_doc] + pdf_docs
 
 db=Chroma.from_documents(docs,embedding_function)
 
-retriever=db.as_retriever(search_type="mmr",search_kwargs={"k":3})
+retriever=db.as_retriever(search_type="similarity",search_kwargs={"k":5})
 
 template="""
- Answer the questionbased on the following context and the chathistory
+ Answer the question based on the following context and the chat history
  .Especially take the lastest question into consideration
- chathistory:{history}
+ chat history:{history}
  context:{context}
  Question:{question}
 """
@@ -106,13 +107,14 @@ def question_rewriter(state:AgentState):
     if "messages" not in state or state['messages'] is None:
         state['messages']=[]
     if state['question'] not in state['messages']:
-        state['messages'].append(state['messages'])    
-    if len(state['messages']>1):
+        state['messages'].append(state['question'])    
+
+    if len(state['messages'])>1:
         conversation=state['messages'][:-1]
         current_question=state['question'].content
         messages=[
             SystemMessage(
-                content="You are helpfu assistant that rephrases the user's question to be a suitable question optimized for the retrieval "
+                content="You are helpful assistant that rephrases the user's question to be a suitable question optimized for the retrieval "
             )
         ]
         messages.extend(conversation) 
@@ -125,14 +127,19 @@ def question_rewriter(state:AgentState):
         state["rephrased_question"]=better_response
     else:
         state['rephrased_question']=state["question"].content
-        return state
+
+    return state
 
 
 def question_classifier(state:AgentState):
     system_message=SystemMessage(
         content="""you are a classifier that determines whether the user's question is about one of the follwowing topics:
            "Information related to gym exercises, diets,Health,Fitness plans"
-           if the question is from one of the following topics respond with 'Yes' otherwise respond with a 'No'
+           if the question is from one of the following topics respond with "Yes" otherwise respond with a "No"
+           Example response format:
+           {"score": "Yes"}
+           or
+           {"score": "No"}
          """
     )        
     human_message=HumanMessage(
@@ -142,15 +149,17 @@ def question_classifier(state:AgentState):
     grade_prompt=ChatPromptTemplate.from_messages([system_message,human_message])
     structured_llm=llm.with_structured_output(GradeQuestion)
     grade_llm=grade_prompt | structured_llm
-    result=grade_llm.invoke({})
+
+    result=grade_llm.invoke({"question": state['rephrased_question']})
     state['ontopic']=result.score.strip()
-    print(f"question_classifier: on_topic = {state['on_topic']}")
+    print(f"question_classifier: ontopic = {state['ontopic']}")
+
     return state
 
 
 def on_topic_router(state:AgentState):
-    on_topic=state.get("ontopic","").strip().lower()
-    if on_topic == 'yes' :
+    ontopic=state.get("ontopic","").strip().lower()
+    if ontopic == 'yes' :
         return "retrieve"
     else:
         return "off_topic_response"
@@ -159,6 +168,9 @@ def on_topic_router(state:AgentState):
 def retrieve(state:AgentState):
     documents=retriever.invoke(state["rephrased_question"])
     state['documents']=documents
+    # for i, doc in enumerate(documents):
+    #     print(f"Doc {i+1}: {doc.page_content[:100]}...")
+    return state
 
 
 class GradeDocuments(BaseModel):
@@ -170,10 +182,14 @@ class GradeDocuments(BaseModel):
 def retrieval_grader(state:AgentState):
     system_message=SystemMessage(
         content="""you are a grader assessing the relevance of the a retrieved documnet to the user question
-         Only answer with 'Yes' or 'No'
 
-         if the documnet contains information relevant to the user's question respond with a 'Yes',
-         otherwise respond with a 'No'
+        You must respond with a JSON object containing a "score" field.
+        The score should be "Yes" if the document contains information relevant to the user's question,
+        or "No" if it does not contain relevant information.
+        
+        {"score": "Yes"}
+           or
+        {"score": "No"}
         """
 
     )
@@ -185,13 +201,38 @@ def retrieval_grader(state:AgentState):
         )
         grade_prompt=ChatPromptTemplate.from_messages([system_message,human_message])
         grade_llm=grade_prompt|structured_llm
-        result=grade_llm.invoke({})
+        result=grade_llm.invoke({"question": state['rephrased_question'], "document": doc.page_content[:1000]})
         if result.score.strip().lower()=='yes':
-            relevant_docs.append(docs)
+            relevant_docs.append(doc)
 
     state['documents']=relevant_docs
-    state["ontopic"]=len(relevant_docs)>0
+    state['proceed_to_answer'] = len(relevant_docs) > 0
+
     return state
+
+
+def refine_question(state: AgentState):
+    rephrase_count = state.get("rephrase_count", 0)
+    if rephrase_count >= 2:
+        return state
+
+    question_to_refine = state['rephrased_question']
+    system_message = SystemMessage(
+        content="You are a helpful assistant that slightly refines the user's question to improve the retrieval results."
+    )
+    human_message = HumanMessage(
+        content=f"Original question: {question_to_refine}\n Provide a slightly refined question."
+    )
+
+    refine_prompt = ChatPromptTemplate.from_messages([system_message, human_message])
+    prompt = refine_prompt.format()
+    response = llm.invoke(prompt)
+    refined_question = response.content.strip()
+
+    state['rephrased_question'] = refined_question
+    state['rephrase_count'] = rephrase_count + 1  
+    return state
+
 
 
 def proceed_router(state:AgentState):
@@ -211,10 +252,10 @@ def generate_answer(state:AgentState):
     history=state['messages']
     documents=state["documents"]
     rephrased_question=state['rephrased_question']
-
+    context_text = "\n\n".join(doc.page_content for doc in documents)
     response=rag_chain.invoke(
         {
-            "history":history,"context":documents,"question":rephrased_question
+            "history":history,"context":context_text,"question":rephrased_question
         }
     )
 
@@ -238,3 +279,69 @@ def cannot_answer(state:AgentState):
 
 
 
+def off_topic_response(state:AgentState):
+    if "messages" not in state or state['messages'] is None:
+        state['messages']=[]
+    state['messages'].append(AIMessage(content="Sorry, i cannot answer this question"))
+    return state
+
+
+checkpointer=MemorySaver()
+
+graph=StateGraph(AgentState)
+
+graph.add_node("question_rewriter",question_rewriter)
+graph.add_node("question_classifier",question_classifier)
+graph.add_node("off_topic_response",off_topic_response)
+graph.add_node("retrieve",retrieve)
+graph.add_node("retrieval_grader",retrieval_grader)
+graph.add_node("generate_answer",generate_answer)
+graph.add_node("refine_question",refine_question)
+graph.add_node("cannot_answer",cannot_answer)
+
+graph.add_edge("question_rewriter","question_classifier")
+graph.add_edge("retrieve","retrieval_grader")
+
+graph.add_conditional_edges(
+    "question_classifier",
+    on_topic_router,
+    {
+        "retrieve":"retrieve",
+        "off_topic_response":"off_topic_response"
+    }
+)
+graph.add_conditional_edges(
+    "retrieval_grader",
+    proceed_router,
+    {
+        "generate_answer":"generate_answer",
+        "cannot_answer":"cannot_answer",
+        "refine_question":"refine_question"
+    }
+)
+
+graph.add_edge("refine_question","retrieve")
+graph.add_edge("generate_answer",END)
+graph.add_edge("cannot_answer",END)
+graph.add_edge("off_topic_response",END)
+graph.set_entry_point("question_rewriter")
+
+app=graph.compile(checkpointer=checkpointer)
+
+reponse=app.invoke({
+"question":HumanMessage(
+        content="Benefits of Running"
+    )
+},config={"configurable":{"thread_id":2}})
+
+print("ON-TOPIC RESPONSE")
+print(reponse['messages'][-1].content)
+
+response=app.invoke({
+"question":HumanMessage(
+        content="Benefits of Keeping Clothes in Summer?"
+    )
+},config={"configurable":{"thread_id":2}})
+
+print("Now OFF-TOPIC QUESTION")
+print(response['messages'][-1].content)
